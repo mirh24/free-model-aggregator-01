@@ -1331,17 +1331,43 @@ def anthropic_error(type_, message):
 # ---------------------------------------------------------------- routing
 
 
+# The providers' published free-tier budget ranges (calls_min, calls_max),
+# from the competition kit's provider table. A trial draws each provider's
+# real budget inside its range and never publishes it, but the ranges say
+# which providers can take repeat calls: a provider whose range tops out
+# at 4 or 5 is likely to refuse its second call, while one that reaches
+# 12 or 16 usually serves several. The router uses the range only as a
+# prior -- what a provider actually does is learned from its refusals.
+CALLS_RANGE = {
+    "groq": (9, 12), "cerebras": (5, 6), "gemini": (6, 8), "zai": (4, 5),
+    "openrouter": (10, 12), "sambanova": (4, 5), "pollinations": (10, 14),
+    "cloudflare": (7, 8), "ovh": (5, 6), "kilol": (12, 16),
+}
+# Only models rated at least this well are preferred for repeat calls; below
+# it the quality lost per request outweighs the call saved.
+RATING_FLOOR_MILLI = 1430
+# No provider is called more than this many times in a trial: past it the
+# odds of hitting its failure schedule or its budget rise steeply, and the
+# extra calls it would serve are cheaper on a provider that is still fresh.
+CALL_CAP = 6
+
+
 class Router:
     """The ranked free candidates and what the trial has taught it so far.
 
-    Candidates are ranked by the quality table's rating, best first; ties go
-    to the provider called least so far, which spreads the load over the
-    providers that share a rating instead of burning one provider's budget.
-    A provider that says its budget is spent, or that it is out, is dead for
-    the rest of the trial. A provider that merely refused one call is not
-    dead -- its next call may serve -- but this request moves on to the next
-    candidate at once: the rating lost is a fraction of a percent, and the
-    call it would have cost is saved for a later request.
+    The old rule ranked by rating alone, so every request went to the same
+    best model until that provider's budget ran out -- then each request
+    paid a wasted call to learn it, and failed over. That cost 25-30
+    upstream calls a trial. The new rule spends the quality slack instead:
+    a request may go to a model up to a little below the best, provided the
+    provider still has budget headroom and has not been called too often.
+    Concretely, inside a tier the candidates rated at least 1430 and called
+    fewer than 6 times come first, ordered by remaining budget headroom
+    (the top of the provider's published range minus calls so far), then
+    by rating; the rest follow in rating order. A provider that says its
+    budget is spent, or that it is out, is dead for the rest of the trial.
+    A provider that merely refused one call is not dead -- its next call
+    may serve -- but this request moves on to the next candidate at once.
     """
 
     def __init__(self, probes, ratings):
@@ -1349,6 +1375,11 @@ class Router:
         self.ratings = ratings
         self.calls = {}   # provider id -> attempts made (success or refusal)
         self.dead = set()  # provider ids that cannot serve again this trial
+
+    def _headroom(self, provider_id):
+        """Calls the provider can still plausibly serve, by its range."""
+        _lo, hi = CALLS_RANGE.get(provider_id, (4, 6))
+        return hi - self.calls.get(provider_id, 0)
 
     def candidates(self, requires, client_api, json_mode):
         """(provider, model, rating) that can serve, best first, in tiers.
@@ -1376,9 +1407,22 @@ class Router:
                 tiers[2].append(entry)
         for tier in tiers:
             if tier:
-                tier.sort(key=lambda e: (-e[2], self.calls.get(e[0]["id"], 0), e[0]["id"], e[1]["id"]))
-                return tier
+                return self._order(tier)
         return []
+
+    def _order(self, tier):
+        """Order one tier: fresh high-rated headroom first, then rating."""
+        pool = [e for e in tier
+                if e[2] >= RATING_FLOOR_MILLI
+                and self.calls.get(e[0]["id"], 0) < CALL_CAP]
+        if not pool:
+            pool = [e for e in tier if self.calls.get(e[0]["id"], 0) < CALL_CAP]
+        if not pool:
+            pool = list(tier)
+        pool.sort(key=lambda e: (-self._headroom(e[0]["id"]), -e[2], e[0]["id"], e[1]["id"]))
+        rest = [e for e in tier if e not in pool]
+        rest.sort(key=lambda e: (-e[2], self.calls.get(e[0]["id"], 0), e[0]["id"], e[1]["id"]))
+        return pool + rest
 
     def note_attempt(self, provider_id):
         self.calls[provider_id] = self.calls.get(provider_id, 0) + 1
